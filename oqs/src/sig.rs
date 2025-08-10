@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 newtype_buffer!(PublicKey, PublicKeyRef);
 newtype_buffer!(SecretKey, SecretKeyRef);
 newtype_buffer!(Signature, SignatureRef);
+newtype_buffer!(KeypairSeed, KeypairSeedRef);
 
 /// Message type
 pub type Message = [u8];
@@ -146,6 +147,36 @@ macro_rules! implement_sigs {
                         let sig = Sig::new(algorithm).unwrap();
                         assert_eq!(algorithm, sig.algorithm());
                     }
+                }
+
+                #[test]
+                #[cfg(feature = $feat)]
+                fn test_sign_verify_derand() -> Result<()> {
+                    use crate::ffi::rand::OQS_randombytes;
+                    crate::init();
+
+                    let alg = Algorithm::$sig;
+                    let sig = Sig::new(alg)?;
+                    let mut seed = KeypairSeed {
+                        bytes: Vec::with_capacity(sig.length_keypair_seed()),
+                    };
+                    unsafe {
+                        // On some systems, getentropy fails if given a zero-length array
+                        if (sig.length_keypair_seed() > 0) {
+                            OQS_randombytes(seed.bytes.as_mut_ptr(), sig.length_keypair_seed());
+                        }
+                        seed.bytes.set_len(sig.length_keypair_seed());
+                    }
+                    let result = sig.keypair_derand(&seed);
+                    // expect Error::Error for SIGs with this API disabled
+                    if (sig.length_keypair_seed() == 0) {
+                        return result.map_or_else(|e| { match e { Error::Error => Ok(()), _ => Err(Error::Error) } }, |_| Err(Error::Error));
+                    }
+                    let (pk, sk) = result?;
+                    let message = b"Test message for deterministic keypair";
+                    let signature = sig.sign(message, &sk)?;
+                    sig.verify(message, &signature, &pk)?;
+                    Ok(())
                 }
 
                 #[test]
@@ -373,6 +404,24 @@ impl Sig {
         }
     }
 
+    /// Construct a keypair seed object from bytes
+    pub fn keypair_seed_from_bytes<'a>(&self, buf: &'a [u8]) -> Option<KeypairSeedRef<'a>> {
+        if buf.len() != self.length_keypair_seed() {
+            None
+        } else {
+            Some(KeypairSeedRef::new(buf))
+        }
+    }
+
+    /// Get the length of the keypair seed for deterministic generation
+    /// 
+    /// Returns the seed length in bytes. 
+    /// Returns 0 for algorithms that don't support deterministic generation.
+    pub fn length_keypair_seed(&self) -> usize {
+        let sig = unsafe { self.sig.as_ref() };
+        sig.length_keypair_seed
+    }
+
     /// Generate a new keypair
     pub fn keypair(&self) -> Result<(PublicKey, SecretKey)> {
         let sig = unsafe { self.sig.as_ref() };
@@ -390,6 +439,42 @@ impl Sig {
             sk.bytes.set_len(sig.length_secret_key);
         }
         status_to_result(status)?;
+        Ok((pk, sk))
+    }
+
+    /// Generate a new keypair deterministically from a seed
+    /// 
+    /// Returns `Error::AlgorithmDisabled` if the algorithm doesn't support deterministic generation.
+    pub fn keypair_derand<'a, S: Into<KeypairSeedRef<'a>>>(
+        &self,
+        seed: S,
+    ) -> Result<(PublicKey, SecretKey)> {
+        let seed = seed.into();
+        if seed.bytes.len() != self.length_keypair_seed() {
+            return Err(Error::InvalidLength);
+        }
+        let sig = unsafe { self.sig.as_ref() };
+        let func = sig.keypair_derand
+            .ok_or(Error::AlgorithmDisabled)?;
+        let mut pk = PublicKey {
+            bytes: Vec::with_capacity(sig.length_public_key),
+        };
+        let mut sk = SecretKey {
+            bytes: Vec::with_capacity(sig.length_secret_key),
+        };
+        let status = unsafe {
+            func(
+                pk.bytes.as_mut_ptr(),
+                sk.bytes.as_mut_ptr(),
+                seed.bytes.as_ptr(),
+            )
+        };
+        status_to_result(status)?;
+
+        unsafe {
+            pk.bytes.set_len(sig.length_public_key);
+            sk.bytes.set_len(sig.length_secret_key);
+        }
         Ok((pk, sk))
     }
 
